@@ -1,3 +1,4 @@
+
 import os
 import re
 import time
@@ -9,11 +10,17 @@ from tempfile import TemporaryDirectory
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
-from telegram import Update
+import aiohttp
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -23,36 +30,42 @@ from yt_dlp.version import __version__ as YTDLP_VERSION
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_API_URL = os.getenv(
+    "ADMIN_API_URL",
+    "https://admin-dl-bot.onrender.com",
+).strip().rstrip("/")
+API_KEY = os.getenv("API_KEY", "").strip()
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN not found")
+
+if not ADMIN_API_URL:
+    raise ValueError("ADMIN_API_URL not found")
+
+if not API_KEY:
+    raise ValueError("API_KEY not found")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 
-# جلوگیری از چاپ توکن ربات توی لاگ (httpx آدرس کامل درخواست را لاگ می‌کند)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 logger.info("yt-dlp version: %s", YTDLP_VERSION)
 
-# سقف ارسال با Bot API معمولی
 MAX_FILE_SIZE = 49 * 1024 * 1024
+MAX_CONCURRENT = max(1, int(os.getenv("MAX_CONCURRENT", "2")))
+COOLDOWN_SECONDS = max(0, int(os.getenv("COOLDOWN_SECONDS", "15")))
 
-# حداکثر تعداد دانلود همزمان (سرور رایگان منابع کمی دارد)
-MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "2"))
-DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT)
-
-# فاصله‌ی حداقل بین دو درخواست یک کاربر (ثانیه)
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "15"))
 _last_request: dict[int, float] = {}
+DOWNLOAD_SEMAPHORE = None
 
 
-# ---------------- Health Server ----------------
+# ==================== سرور سلامت Render ====================
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -72,7 +85,172 @@ def start_health_server():
     server.serve_forever()
 
 
-# ---------------- URL Validation ----------------
+# ==================== جوین اجباری ====================
+
+async def check_membership(user_id: int):
+    """
+    خروجی:
+    (True, [])      کاربر مجاز است
+    (False, list)   کاربر عضو همه کانال‌های لازم نیست
+    (None, [])      بررسی عضویت ناموفق بوده است
+    """
+
+    url = f"{ADMIN_API_URL}/api/check"
+    headers = {"X-API-Key": API_KEY}
+    params = {"user_id": user_id}
+    timeout = aiohttp.ClientTimeout(total=20)
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                url,
+                headers=headers,
+                params=params,
+            ) as response:
+
+                if response.status != 200:
+                    logger.error(
+                        "Membership API returned HTTP %s",
+                        response.status,
+                    )
+                    return None, []
+
+                data = await response.json()
+
+        if not isinstance(data, dict):
+            logger.error("Invalid membership API response")
+            return None, []
+
+        # اگر جوین اجباری در پنل خاموش باشد، اجازه استفاده داده می‌شود.
+        if data.get("enabled") is False:
+            return True, []
+
+        missing = data.get("missing", [])
+
+        if not isinstance(missing, list):
+            logger.error("Invalid missing channels list")
+            return None, []
+
+        # تنها پاسخ صریح و معتبر اجازه عبور می‌دهد.
+        if data.get("ok") is True and not missing:
+            return True, []
+
+        if data.get("ok") is False:
+            return False, missing
+
+        logger.error("Membership API returned an uncertain result")
+        return None, []
+
+    except Exception:
+        logger.exception("Membership API request failed")
+        return None, []
+
+
+def membership_markup(missing: list) -> InlineKeyboardMarkup:
+    rows = []
+
+    for channel in missing:
+        if not isinstance(channel, dict):
+            continue
+
+        link = channel.get("link")
+        title = channel.get("title") or "کانال"
+
+        if isinstance(link, str) and link.startswith(
+            ("https://", "http://")
+        ):
+            rows.append([
+                InlineKeyboardButton(
+                    text=f"عضویت در {title[:40]}",
+                    url=link,
+                )
+            ])
+
+    rows.append([
+        InlineKeyboardButton(
+            text="✅ عضو شدم، بررسی مجدد",
+            callback_data="join:check",
+        )
+    ])
+
+    return InlineKeyboardMarkup(rows)
+
+
+async def require_membership(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+
+    user = update.effective_user
+    message = update.effective_message
+
+    if not user or not message:
+        return False
+
+    allowed, missing = await check_membership(user.id)
+
+    if allowed is True:
+        return True
+
+    if allowed is None:
+        await message.reply_text(
+            "⚠️ در حال حاضر امکان بررسی عضویت وجود ندارد.\n"
+            "لطفاً کمی بعد دوباره تلاش کن."
+        )
+        return False
+
+    await message.reply_text(
+        "🔒 برای استفاده از ربات، ابتدا در کانال‌های زیر عضو شو.\n\n"
+        "بعد از عضویت روی «عضو شدم، بررسی مجدد» بزن.",
+        reply_markup=membership_markup(missing),
+    )
+
+    return False
+
+
+async def recheck_membership(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not query:
+        return
+
+    allowed, missing = await check_membership(
+        query.from_user.id
+    )
+
+    if allowed is None:
+        await query.answer(
+            "بررسی عضویت ناموفق بود؛ کمی بعد دوباره تلاش کن.",
+            show_alert=True,
+        )
+        return
+
+    await query.answer()
+
+    if allowed is True:
+        try:
+            await query.edit_message_text(
+                "✅ عضویتت تأیید شد!\n\n"
+                "حالا لینک آهنگ ساندکلود رو بفرست."
+            )
+        except Exception:
+            pass
+        return
+
+    try:
+        await query.edit_message_text(
+            "❌ هنوز عضویتت در همه کانال‌های لازم تأیید نشده.\n\n"
+            "عضو شو و دوباره بررسی کن.",
+            reply_markup=membership_markup(missing),
+        )
+    except Exception:
+        pass
+
+
+# ==================== بررسی لینک ساندکلود ====================
 
 SOUNDCLOUD_HOSTS = {
     "soundcloud.com",
@@ -81,16 +259,26 @@ SOUNDCLOUD_HOSTS = {
     "on.soundcloud.com",
 }
 
-# بخش‌هایی از آدرس که تک‌آهنگ نیستند (پروفایل، لیست‌ها و ...)
 NON_TRACK_SEGMENTS = {
-    "sets", "likes", "tracks", "albums", "reposts",
-    "popular-tracks", "following", "followers", "comments",
+    "sets",
+    "likes",
+    "tracks",
+    "albums",
+    "reposts",
+    "popular-tracks",
+    "following",
+    "followers",
+    "comments",
 }
 
 
 def extract_url(text: str):
     match = re.search(r"https?://\S+", text)
-    return match.group(0) if match else None
+
+    if not match:
+        return None
+
+    return match.group(0).rstrip(".,!?)]}")
 
 
 def is_soundcloud_url(url: str) -> bool:
@@ -102,11 +290,12 @@ def is_soundcloud_url(url: str) -> bool:
 
 
 def is_track_url(url: str) -> bool:
-    """فقط لینک تک‌آهنگ: soundcloud.com/artist/track یا لینک کوتاه on.soundcloud.com/xxx"""
     try:
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
-        segments = [x for x in parsed.path.split("/") if x]
+        segments = [
+            part for part in parsed.path.split("/") if part
+        ]
 
         if host == "on.soundcloud.com":
             return len(segments) >= 1
@@ -115,23 +304,30 @@ def is_track_url(url: str) -> bool:
             return False
 
         return segments[1].lower() not in NON_TRACK_SEGMENTS
+
     except Exception:
         return False
 
 
-# ---------------- Bot Commands ----------------
+# ==================== دستور شروع ====================
 
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    if not await require_membership(update, context):
+        return
+
     await update.effective_message.reply_text(
         "سلام 👋\n\n"
-        "لینک یک آهنگ ساندکلود را بفرست تا برایت بفرستم. 🎧\n"
-        "فقط لینک تک‌آهنگ پشتیبانی می‌شود (نه پروفایل یا پلی‌لیست).\n"
-        "فقط آهنگ‌هایی را دانلود کن که مال خودت هستند یا اجازه‌ی دانلودشان را داری."
+        "🎧 لینک یک آهنگ ساندکلود رو بفرست تا برات دانلود کنم.\n"
+        "فقط لینک تک‌آهنگ پشتیبانی می‌شه؛ نه پروفایل یا پلی‌لیست.\n\n"
+        "⚠️ فقط آهنگ‌هایی رو دانلود کن که متعلق به خودت هستن "
+        "یا اجازه دانلودشون رو داری."
     )
 
+
+# ==================== دانلود آهنگ ====================
 
 async def handle_url(
     update: Update,
@@ -140,6 +336,10 @@ async def handle_url(
     message = update.effective_message
 
     if not message or not message.text:
+        return
+
+    # عضویت قبل از دسترسی به قابلیت‌های ربات بررسی می‌شود.
+    if not await require_membership(update, context):
         return
 
     url = extract_url(message.text)
@@ -152,79 +352,104 @@ async def handle_url(
 
     if not is_track_url(url):
         await message.reply_text(
-            "❌ فقط لینک تک‌آهنگ پشتیبانی می‌شود (نه پروفایل یا پلی‌لیست).\n"
+            "❌ فقط لینک تک‌آهنگ پشتیبانی می‌شه، نه پروفایل یا پلی‌لیست.\n"
             "نمونه: soundcloud.com/artist/track"
         )
         return
 
-    # محدودیت فاصله‌ی زمانی برای هر کاربر
-    user_id = update.effective_user.id if update.effective_user else 0
+    user = update.effective_user
+    user_id = user.id if user else 0
+
     now = time.monotonic()
     last = _last_request.get(user_id, 0)
+
     if now - last < COOLDOWN_SECONDS:
         wait = int(COOLDOWN_SECONDS - (now - last)) + 1
-        await message.reply_text(f"⏳ لطفاً {wait} ثانیه‌ی دیگر دوباره تلاش کن.")
+        await message.reply_text(
+            f"⏳ لطفاً {wait} ثانیه دیگه دوباره تلاش کن."
+        )
         return
+
     _last_request[user_id] = now
 
-    status = await message.reply_text("⏳ در حال آماده‌سازی آهنگ...")
+    status = await message.reply_text(
+        "⏳ لینک دریافت شد؛ در حال آماده‌سازی آهنگ..."
+    )
 
     try:
         async with DOWNLOAD_SEMAPHORE:
             with TemporaryDirectory() as tmpdir:
                 opts = {
-                    "outtmpl": str(Path(tmpdir) / "audio.%(ext)s"),
-                    "quiet": False,
-                    "no_warnings": False,
+                    "outtmpl": str(
+                        Path(tmpdir) / "audio.%(ext)s"
+                    ),
+                    "quiet": True,
+                    "no_warnings": True,
                     "noplaylist": True,
-                    # اگر لینک اشتباهی پلی‌لیست بود، فقط اولین آهنگ
-                    "playlist_items": "1",
                     "socket_timeout": 30,
-                    # mp3 مستقیم (بدون نیاز به ffmpeg)، وگرنه بهترین صدا
-                    "format": "http_mp3_128/bestaudio[protocol^=http]/bestaudio",
+                    "format": (
+                        "http_mp3_128/"
+                        "bestaudio[protocol^=http]/bestaudio"
+                    ),
                 }
 
-                def run():
+                def download():
                     with yt_dlp.YoutubeDL(opts) as ydl:
-                        return ydl.extract_info(url, download=True)
+                        return ydl.extract_info(
+                            url,
+                            download=True,
+                        )
 
-                info = await asyncio.to_thread(run)
+                info = await asyncio.to_thread(download)
 
-                # اگر نتیجه پلی‌لیست بود، اولین آهنگ
                 entries = info.get("entries")
                 if entries:
-                    entries = [e for e in entries if e]
+                    entries = [entry for entry in entries if entry]
                     if entries:
                         info = entries[0]
 
                 audio_exts = {
-                    ".mp3", ".m4a", ".opus", ".ogg", ".aac", ".wav", ".flac", ".webm",
+                    ".mp3", ".m4a", ".opus", ".ogg",
+                    ".aac", ".wav", ".flac", ".webm",
                 }
+
                 files = [
-                    p for p in Path(tmpdir).iterdir()
-                    if p.is_file()
-                    and p.suffix.lower() in audio_exts
-                    and p.stat().st_size > 0
+                    path
+                    for path in Path(tmpdir).iterdir()
+                    if path.is_file()
+                    and path.suffix.lower() in audio_exts
+                    and path.stat().st_size > 0
                 ]
 
                 if not files:
-                    raise FileNotFoundError("Downloaded audio was not found")
+                    raise FileNotFoundError(
+                        "Downloaded audio was not found"
+                    )
 
-                filename = max(files, key=lambda p: p.stat().st_size)
+                filename = max(
+                    files,
+                    key=lambda path: path.stat().st_size,
+                )
 
                 if filename.stat().st_size > MAX_FILE_SIZE:
                     await status.edit_text(
-                        "❌ حجم این آهنگ از سقف ارسال ربات (حدود ۵۰ مگابایت) بیشتر است."
+                        "❌ حجم این آهنگ از سقف ارسال ربات "
+                        "(حدود ۵۰ مگابایت) بیشتره."
                     )
                     return
 
                 title = info.get("title") or "audio"
                 performer = info.get("uploader") or ""
-                safe_name = (
-                    re.sub(r'[\\/:*?"<>|]+', "_", title)[:80].strip() or "audio"
-                )
 
-                await status.edit_text("📤 آهنگ آماده است؛ در حال ارسال...")
+                safe_name = re.sub(
+                    r'[\\/:*?"<>|]+',
+                    "_",
+                    title,
+                )[:80].strip() or "audio"
+
+                await status.edit_text(
+                    "📤 آهنگ آماده شد؛ در حال ارسال..."
+                )
 
                 with filename.open("rb") as audio:
                     await context.bot.send_audio(
@@ -242,17 +467,34 @@ async def handle_url(
 
                 await status.delete()
 
-    except Exception as e:
+    except Exception:
         logger.exception("SoundCloud download failed")
-        await status.edit_text(f"❌ خطا:\n{str(e)[:700]}")
+
+        try:
+            await status.edit_text(
+                "❌ دانلود انجام نشد.\n"
+                "ممکنه لینک خصوصی یا غیرقابل دانلود باشه؛ "
+                "لطفاً دوباره تلاش کن."
+            )
+        except Exception:
+            pass
 
 
-async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
-    # خطاهای شبکه‌ی گذرا (مثل Conflict هنگام دیپلوی) را فقط کوتاه لاگ می‌کنیم
-    logger.warning("Bot error: %s", context.error)
+# ==================== مدیریت خطاها ====================
+
+async def on_error(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    logger.error("Bot error: %s", context.error)
 
 
-# ---------------- Main ----------------
+# ==================== اجرای ربات ====================
+
+async def post_init(app: Application):
+    global DOWNLOAD_SEMAPHORE
+    DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT)
+
 
 def main():
     threading.Thread(
@@ -260,19 +502,33 @@ def main():
         daemon=True,
     ).start()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
+
+    app.add_handler(
+        CallbackQueryHandler(
+            recheck_membership,
+            pattern=r"^join:check$",
+        )
+    )
+
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             handle_url,
         )
     )
+
     app.add_error_handler(on_error)
 
     logger.info("SoundCloud bot is starting...")
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
