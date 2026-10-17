@@ -1,4 +1,3 @@
-
 import os
 import re
 import time
@@ -15,6 +14,11 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeAllPrivateChats,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 from telegram.ext import (
     Application,
@@ -83,6 +87,53 @@ def start_health_server():
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     logger.info("Health server started on port %s", port)
     server.serve_forever()
+
+
+# ==================== منوی آبی کنار کیبورد (Bot Commands) ====================
+
+async def setup_bot_commands(app: Application):
+    commands = [
+        BotCommand("start", "🚀 استارت"),
+    ]
+
+    await app.bot.set_my_commands(
+        commands,
+        scope=BotCommandScopeDefault(),
+    )
+
+    await app.bot.set_my_commands(
+        commands,
+        scope=BotCommandScopeAllPrivateChats(),
+    )
+
+    logger.info("Bot commands configured.")
+
+
+# ==================== منوی شیشه‌ای (Inline Keyboard) جای کیبورد ====================
+
+def get_main_inline_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🚀 استارت",
+                callback_data="menu:start",
+            )
+        ],
+    ])
+
+
+# ==================== کیبورد پایین (Reply Keyboard) با دکمه استارت ====================
+
+def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
+    keyboard = [
+        [KeyboardButton("🚀 استارت")],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="لینک ساندکلود را بفرست یا استارت بزن...",
+    )
 
 
 # ==================== جوین اجباری ====================
@@ -318,13 +369,76 @@ async def start(
     if not await require_membership(update, context):
         return
 
+    # کیبورد پایین با دکمه استارت
     await update.effective_message.reply_text(
         "سلام 👋\n\n"
         "🎧 لینک یک آهنگ ساندکلود رو بفرست تا برات دانلود کنم.\n"
         "فقط لینک تک‌آهنگ پشتیبانی می‌شه؛ نه پروفایل یا پلی‌لیست.\n\n"
         "⚠️ فقط آهنگ‌هایی رو دانلود کن که متعلق به خودت هستن "
-        "یا اجازه دانلودشون رو داری."
+        "یا اجازه دانلودشون رو داری.",
+        reply_markup=get_main_reply_keyboard(),
     )
+
+    # منوی شیشه‌ای جای کیبورد
+    await update.effective_message.reply_text(
+        "👇 از دکمه زیر هم می‌تونی استفاده کنی:",
+        reply_markup=get_main_inline_keyboard(),
+    )
+
+
+# ==================== هندلر دکمه استارت از کیبورد پایین ====================
+
+async def handle_reply_keyboard(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    if message.text.strip() == "🚀 استارت":
+        await start(update, context)
+
+
+# ==================== هندلر دکمه‌های شیشه‌ای منو ====================
+
+async def menu_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    if not query:
+        return
+
+    await query.answer()
+
+    if query.data == "menu:start":
+        # بررسی عضویت
+        allowed, missing = await check_membership(query.from_user.id)
+
+        if allowed is True:
+            await query.message.reply_text(
+                "سلام 👋\n\n"
+                "🎧 لینک یک آهنگ ساندکلود رو بفرست تا برات دانلود کنم.\n"
+                "فقط لینک تک‌آهنگ پشتیبانی می‌شه؛ نه پروفایل یا پلی‌لیست.\n\n"
+                "⚠️ فقط آهنگ‌هایی رو دانلود کن که متعلق به خودت هستن "
+                "یا اجازه دانلودشون رو داری.",
+                reply_markup=get_main_reply_keyboard(),
+            )
+            return
+
+        if allowed is None:
+            await query.answer(
+                "بررسی عضویت ناموفق بود؛ کمی بعد دوباره تلاش کن.",
+                show_alert=True,
+            )
+            return
+
+        await query.message.reply_text(
+            "🔒 برای استفاده از ربات، ابتدا در کانال‌های زیر عضو شو.\n\n"
+            "بعد از عضویت روی «عضو شدم، بررسی مجدد» بزن.",
+            reply_markup=membership_markup(missing),
+        )
 
 
 # ==================== دانلود آهنگ ====================
@@ -494,6 +608,7 @@ async def on_error(
 async def post_init(app: Application):
     global DOWNLOAD_SEMAPHORE
     DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT)
+    await setup_bot_commands(app)
 
 
 def main():
@@ -515,6 +630,21 @@ def main():
         CallbackQueryHandler(
             recheck_membership,
             pattern=r"^join:check$",
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            menu_callback,
+            pattern=r"^menu:",
+        )
+    )
+
+    # هندلر دکمه استارت از کیبورد پایین (قبل از handle_url)
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.Regex(r"^🚀 استارت$"),
+            handle_reply_keyboard,
         )
     )
 
