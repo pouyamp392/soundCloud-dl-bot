@@ -1,3 +1,5 @@
+
 python-telegram-bot>=21.0,<23.0
 python-dotenv
 yt-dlp[default]
+aiohttp
