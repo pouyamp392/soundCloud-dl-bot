@@ -379,12 +379,6 @@ async def start(
         reply_markup=get_main_reply_keyboard(),
     )
 
-    # منوی شیشه‌ای جای کیبورد
-    await update.effective_message.reply_text(
-        "👇 از دکمه زیر هم می‌تونی استفاده کنی:",
-        reply_markup=get_main_inline_keyboard(),
-    )
-
 
 # ==================== هندلر دکمه استارت از کیبورد پایین ====================
 
